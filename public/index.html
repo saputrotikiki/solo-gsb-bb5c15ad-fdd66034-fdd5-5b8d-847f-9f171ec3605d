@@ -137,7 +137,7 @@
       <div class="panel panel-questions">
         <div class="panel-title">
           ❓ 现场问题墙 <span class="count" id="question-count">0</span>
-          <span class="hint">提交不超过 120 字的问题，点 👍 支持；支持越多越靠前</span>
+          <span class="hint">提交不超过 120 字的问题，点 👍 支持；支持越多越靠前；主持人可答复结案</span>
         </div>
 
         <!-- 当前成员提交问题 -->
@@ -152,11 +152,14 @@
           </div>
         </form>
 
-        <!-- 未合并问题：按支持人数降序 -->
+        <!-- 未结案、未合并问题：按支持人数降序 -->
         <ul class="question-list" id="question-list"></ul>
         <div class="question-empty" id="question-empty">还没有人提交问题，写下第一个现场问题吧</div>
 
-        <!-- 已合并问题：可查看合并去向 -->
+        <!-- 已结案问题：主持人答复记录（固定支持人数/支持者/沿链来源） -->
+        <div class="question-closed" id="question-closed"></div>
+
+        <!-- 已合并问题：可查看合并去向（终点结案时带最终答复） -->
         <div class="question-merged" id="question-merged"></div>
       </div>
 

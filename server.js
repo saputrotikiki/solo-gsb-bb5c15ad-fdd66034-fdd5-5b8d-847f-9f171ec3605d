@@ -42,6 +42,7 @@
  *   { type: "question_submit",  version, text }                       // 当前成员：提交现场问题（≤120 字）
  *   { type: "question_support", version, questionId }                 // 当前成员：对未合并问题切换支持状态
  *   { type: "question_merge",   version, sourceId, targetId }         // 主持人：把来源问题并入另一条未合并问题
+ *   { type: "question_close",   version, questionId, answer }         // 主持人：填写 1~300 字答复并结案（仅未合并、未结案）
  *
  * 服务端 -> 客户端
  *   { type: "joined",  snapshot, you:{id,secret,host} }
@@ -135,11 +136,23 @@
  * 问题切换支持状态（question_support，同一成员对同一问题只计一次，重复命令即取消
  * 支持）。主持人可把一条问题并入另一条未合并问题（question_merge）：目标问题合并
  * 两边支持者（按成员去重，同一成员只计一次），来源问题标记 mergedInto 且不再接受
- * 支持（对已合并问题的支持/合并一律拒绝，计数不变）。问题与支持记录随快照 questions
- * 字段下发，断线重连后凭快照完整恢复。提交/支持/合并全部沿用现有 WebSocket 身份与
- * 版本守卫：过期返回 STALE_VERSION + 最新快照，针对已合并问题的操作返回
- * QUESTION_MERGED 且不改变计数。页面按支持人数降序展示未合并问题（同票按提交时间
- * 先后），已合并问题可查看合并去向（沿合并链解析到最终目标）。
+ * 支持（对已合并问题的支持/合并一律拒绝，计数不变）。
+ *
+ * 问题答复结案：主持人可对一条未合并、未结案的问题填写 1～300 字答复并结案
+ * （question_close）。结案时固定该问题的支持人数与支持者、记录答复人与答复时间，
+ * 并把沿合并链归入它的来源问题（直接来源 + 各级间接来源）一并快照入答复记录；
+ * 结案后该问题不可再获支持或参与合并（支持/合并/重复结案分别返回
+ * QUESTION_CLOSED 且不改变版本与记录），空白或超长答复返回 NO_QUESTION_ANSWER /
+ * QUESTION_ANSWER_TOO_LONG。已结案问题连同答复在快照 questions.closed 中单独展示，
+ * 已合并来源的最终去向解析到已结案问题时可直接展示最终答复。快照随房间状态保存，
+ * 断线重连后凭快照完整恢复。
+ *
+ * 问题与支持记录随快照 questions 字段下发，断线重连后凭快照完整恢复。提交/支持/
+ * 合并/结案全部沿用现有 WebSocket 身份与版本守卫：过期返回 STALE_VERSION + 最新
+ * 快照，针对已合并问题的操作返回 QUESTION_MERGED，针对已结案问题的操作返回
+ * QUESTION_CLOSED，均不改变计数。页面按支持人数降序展示未合并问题（同票按提交
+ * 时间先后），已合并问题可查看合并去向（沿合并链解析到最终目标，目标结案时带最终
+ * 答复），已结案问题按结案时间倒序单独展示。
  */
 
 'use strict';
@@ -199,7 +212,10 @@ const GROUP_MAX_CONSTRAINTS = 66;
 const GROUP_CONSTRAINT_TYPES = ['together', 'apart'];
 // 现场问题墙：问题正文最大长度
 const QUESTION_TEXT_MAX = 120;
-// 现场问题墙：未合并问题数量上限（防止内存无限增长；已合并问题随来源留存）
+// 现场问题墙：结案答复长度区间（去空白后按字符数计）
+const QUESTION_ANSWER_MIN = 1;
+const QUESTION_ANSWER_MAX = 300;
+// 现场问题墙：未合并（且未结案）问题数量上限（防止内存无限增长；已合并/已结案问题随来源留存）
 const QUESTION_MAX_OPEN = parseInt(process.env.QUESTION_MAX_OPEN, 10) || 300;
 
 const app = express();
@@ -283,13 +299,22 @@ app.use(express.static(path.join(__dirname, 'public')));
  *     constraints: [{ a, b, type }],     // 生成时的约束（type: together|apart）
  *     groups: [[idx...]]                  // 分组结果：以 members 下标表示，每人恰好出现一次，组规模差 ≤1
  *   },
- *   questions: Map<id, {      // 现场问题墙（提交、支持、合并；无定时任务）
+ *   questions: Map<id, {      // 现场问题墙（提交、支持、合并、结案；无定时任务）
  *     id, text,               // 问题正文（≤120 字）
  *     authorId, authorNick,   // 提交人（昵称按提交时留存，离开房间后仍可展示）
  *     createdAt,
- *     supporters: Set<pid>,   // 当前支持者（合并时按成员去重并入目标）
+ *     supporters: Set<pid>,   // 当前支持者（合并时按成员去重并入目标；结案后冻结不再变化）
  *     mergedInto: pid|null,   // 非 null 表示已并入该问题（直接去向；快照解析沿合并链到最终目标）
- *     mergedAt, mergedBy      // 合并时间与操作者（主持人）
+ *     mergedAt, mergedBy,     // 合并时间与操作者（主持人）
+ *     closedAt: ts|null,      // 非 null 表示已结案（仅未合并问题可结案；结案后不可支持/合并/再结案）
+ *     answer,                 // 结案答复正文（1~300 字）；结案前为 null
+ *     answeredBy,             // 结案答复人 participantId（主持人）
+ *     answeredByNick,         // 结案时留存的答复人昵称
+ *     answerSources: [       // 结案瞬间沿合并链归入该问题的来源问题快照（直接 + 各级间接，按合并时间升序）
+ *       { id, text, authorId, authorNick, createdAt, mergedAt, mergedByNick,
+ *         supportCount, supporterIds, supporters: [{id,nick}] }
+ *     ],
+ *     answerSupporters: [    // 结案瞬间冻结的目标问题支持者快照 [{id,nick}]（支持人数以其长度固定）
  *   }>,
  *   logs: [{id, ts, kind, text}],
  *   createdAt, lastSeen
@@ -1050,10 +1075,49 @@ function resolveQuestionRoot(room, questionId) {
   }
 }
 
-/** 问题快照视图：支持者实时昵称解析（已离开房间则标注，但支持计数仍保留） */
-function buildQuestionView(room, q) {
-  const root = q.mergedInto ? resolveQuestionRoot(room, q.id) : null;
-  const rootQ = root ? room.questions.get(root.rootId) : null;
+/**
+ * 结案时冻结的支持者/来源问题昵称解析：优先取房间内当前昵称，
+ * 成员已离开时回退到留存昵称（再兜底「已离开」），保证快照可追溯。
+ */
+function resolveQuestionNick(room, pid, fallbackNick) {
+  const p = room.participants.get(pid);
+  if (p) return p.nick;
+  return fallbackNick || '已离开';
+}
+
+/** 结案瞬间冻结一名支持者（昵称一并留存） */
+function freezeQuestionSupporter(room, pid) {
+  return { id: pid, nick: resolveQuestionNick(room, pid, null) };
+}
+
+/** 结案瞬间沿合并链收集全部来源问题快照（直接来源 + 各级间接来源，按合并时间升序） */
+function freezeQuestionSources(room, targetId) {
+  const sources = [];
+  for (const q of room.questions.values()) {
+    if (!q.mergedInto) continue;
+    const root = resolveQuestionRoot(room, q.id);
+    if (root.rootId !== targetId || root.hops === 0) continue;
+    sources.push({
+      id: q.id,
+      text: q.text,
+      authorId: q.authorId,
+      authorNick: q.authorNick,
+      createdAt: q.createdAt,
+      mergedInto: q.mergedInto,
+      mergedRootId: root.rootId,
+      mergedAt: q.mergedAt,
+      mergedByNick: q.mergedBy ? resolveQuestionNick(room, q.mergedBy, '主持人') : '主持人',
+      supportCount: q.supporters.size,
+      supporterIds: [...q.supporters],
+      supporters: [...q.supporters].map((sp) => ({ id: sp, nick: resolveQuestionNick(room, sp, null) }))
+    });
+  }
+  sources.sort((a, b) => (a.mergedAt || 0) - (b.mergedAt || 0) || (a.id < b.id ? -1 : 1));
+  return sources;
+}
+
+/** 未合并、未结案问题快照视图：支持者实时昵称解析（已离开房间则标注，但支持计数仍保留） */
+function buildOpenQuestionView(room, q) {
   const supporters = [...q.supporters].map((pid) => {
     const p = room.participants.get(pid);
     return {
@@ -1072,26 +1136,91 @@ function buildQuestionView(room, q) {
     supportCount: q.supporters.size,
     supporterIds: [...q.supporters],
     supporters,
-    merged: q.mergedInto !== null,
+    merged: false,
+    closed: false
+  };
+}
+
+/**
+ * 已合并问题快照视图：直接去向 + 沿合并链解析的最终目标。
+ * 最终目标若已结案，额外带上最终答复（rootClosed/rootAnswer/rootAnsweredByNick/rootClosedAt），
+ * 保证来源问题仍能找到最终答复。
+ */
+function buildMergedQuestionView(room, q) {
+  const root = resolveQuestionRoot(room, q.id);
+  const rootQ = room.questions.get(root.rootId);
+  const supporters = [...q.supporters].map((pid) => {
+    const p = room.participants.get(pid);
+    return {
+      id: pid,
+      nick: p ? p.nick : '已离开',
+      present: room.participants.has(pid)
+    };
+  });
+  const view = {
+    id: q.id,
+    text: q.text,
+    authorId: q.authorId,
+    authorNick: room.participants.get(q.authorId)?.nick ?? q.authorNick,
+    authorPresent: room.participants.has(q.authorId),
+    createdAt: q.createdAt,
+    supportCount: q.supporters.size,
+    supporterIds: [...q.supporters],
+    supporters,
+    merged: true,
     mergedInto: q.mergedInto,
     mergedIntoText: rootQ ? rootQ.text : null,
-    mergedRootId: root ? root.rootId : null,
+    mergedRootId: root.rootId,
     mergedAt: q.mergedAt ?? null,
-    mergedByNick: q.mergedBy ? room.participants.get(q.mergedBy)?.nick ?? '主持人' : null
+    mergedByNick: q.mergedBy ? room.participants.get(q.mergedBy)?.nick ?? '主持人' : null,
+    rootClosed: rootQ ? rootQ.closedAt !== null : false,
+    rootAnswer: rootQ && rootQ.closedAt !== null ? rootQ.answer : null,
+    rootAnsweredByNick: rootQ && rootQ.closedAt !== null ? rootQ.answeredByNick : null,
+    rootClosedAt: rootQ && rootQ.closedAt !== null ? rootQ.closedAt : null
+  };
+  return view;
+}
+
+/**
+ * 已结案问题快照视图：答复与结案时固定的支持人数/支持者/沿链来源全部取冻结快照，
+ * 昵称按结案时留存（成员事后离开/改名不影响可追溯记录）。
+ */
+function buildClosedQuestionView(q) {
+  return {
+    id: q.id,
+    text: q.text,
+    authorId: q.authorId,
+    authorNick: q.authorNick,
+    createdAt: q.createdAt,
+    closedAt: q.closedAt,
+    answer: q.answer,
+    answeredBy: q.answeredBy,
+    answeredByNick: q.answeredByNick,
+    supportCount: q.answerSupporters.length,
+    supporterIds: q.answerSupporters.map((s) => s.id),
+    supporters: q.answerSupporters.map((s) => ({ id: s.id, nick: s.nick })),
+    sources: q.answerSources
   };
 }
 
 /**
  * 问题墙快照视图：
- * - open：未合并问题，按支持人数降序（同票按提交时间升序，再按 id 稳定兜底）；
- * - merged：已合并问题，按合并时间降序（最新合并在前）。
+ * - open：未合并、未结案问题，按支持人数降序（同票按提交时间升序，再按 id 稳定兜底）；
+ * - merged：已合并问题（无论最终目标是否结案），按合并时间降序（最新合并在前）；
+ * - closed：已结案问题（连同答复与冻结记录），按结案时间降序。
  */
 function buildQuestionsView(room) {
   const open = [];
   const merged = [];
+  const closed = [];
   for (const q of room.questions.values()) {
-    if (q.mergedInto) merged.push(buildQuestionView(room, q));
-    else open.push(buildQuestionView(room, q));
+    if (q.mergedInto) {
+      merged.push(buildMergedQuestionView(room, q));
+    } else if (q.closedAt !== null) {
+      closed.push(buildClosedQuestionView(q));
+    } else {
+      open.push(buildOpenQuestionView(room, q));
+    }
   }
   open.sort((a, b) => {
     if (b.supportCount !== a.supportCount) return b.supportCount - a.supportCount;
@@ -1099,7 +1228,8 @@ function buildQuestionsView(room) {
     return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
   });
   merged.sort((a, b) => (b.mergedAt || 0) - (a.mergedAt || 0));
-  return { open, merged };
+  closed.sort((a, b) => (b.closedAt || 0) - (a.closedAt || 0));
+  return { open, merged, closed };
 }
 
 // ---------------------------------------------------------------------------
@@ -1455,6 +1585,7 @@ wss.on('connection', (ws) => {
         case 'question_submit':
         case 'question_support':
         case 'question_merge':
+        case 'question_close':
           return handleCommand(ws, msg, room, pid, isHost);
 
         default:
@@ -2488,7 +2619,7 @@ function handleCommand(ws, msg, room, pid, isHost) {
       }
       let open = 0;
       for (const q of room.questions.values()) {
-        if (!q.mergedInto) open += 1;
+        if (!q.mergedInto && q.closedAt === null) open += 1;
       }
       if (open >= QUESTION_MAX_OPEN) {
         return sendError(ws, `未合并问题已达上限（${QUESTION_MAX_OPEN} 条）`, 'QUESTION_LIMIT', room);
@@ -2503,7 +2634,13 @@ function handleCommand(ws, msg, room, pid, isHost) {
         supporters: new Set(),
         mergedInto: null,
         mergedAt: null,
-        mergedBy: null
+        mergedBy: null,
+        closedAt: null,
+        answer: null,
+        answeredBy: null,
+        answeredByNick: null,
+        answerSources: [],
+        answerSupporters: []
       };
       room.questions.set(question.id, question);
       addLog(room, 'question', `「${me.nick}」提交了现场问题：${text.length > 40 ? text.slice(0, 40) + '…' : text}`);
@@ -2519,6 +2656,10 @@ function handleCommand(ws, msg, room, pid, isHost) {
       // 针对已合并问题的支持操作一律拒绝，计数不变
       if (question.mergedInto) {
         return sendError(ws, '该问题已合并，不能再支持', 'QUESTION_MERGED', room);
+      }
+      // 结案后的问题不可再获支持（支持人数已固定），拒绝且不改变记录
+      if (question.closedAt !== null) {
+        return sendError(ws, '该问题已结案，不能再支持', 'QUESTION_CLOSED', room);
       }
       // 切换支持状态：同一成员只计一次，重复命令即取消支持
       if (question.supporters.has(pid)) {
@@ -2552,6 +2693,13 @@ function handleCommand(ws, msg, room, pid, isHost) {
       if (target.mergedInto) {
         return sendError(ws, '目标问题已合并，请选择未合并问题作为目标', 'QUESTION_MERGED', room);
       }
+      // 已结案问题不参与合并：来源/目标结案都明确拒绝且不改变记录
+      if (source.closedAt !== null) {
+        return sendError(ws, '来源问题已结案，不能再参与合并', 'QUESTION_CLOSED', room);
+      }
+      if (target.closedAt !== null) {
+        return sendError(ws, '目标问题已结案，不能再并入', 'QUESTION_CLOSED', room);
+      }
       // 合并两边支持者：同一成员只计一次（Set 天然去重，原子完成）
       let added = 0;
       for (const sup of source.supporters) {
@@ -2569,6 +2717,50 @@ function handleCommand(ws, msg, room, pid, isHost) {
         'question',
         `主持人将一条问题并入「${target.text.length > 30 ? target.text.slice(0, 30) + '…' : target.text}」` +
           `（合并 ${source.supporters.size} 名支持者，新增 ${added} 人，目标共 ${target.supporters.size} 人支持）`
+      );
+      return commit(room, { undoReason: 'question_changed' });
+    }
+
+    case 'question_close': {
+      if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
+      const question = room.questions.get(String(msg.questionId || ''));
+      if (!question) {
+        return sendError(ws, '问题不存在', 'NO_QUESTION', room);
+      }
+      // 已合并来源不能单独结案（其最终答复随合并链终点一并给出）
+      if (question.mergedInto) {
+        return sendError(ws, '该问题已合并，不能单独结案', 'QUESTION_MERGED', room);
+      }
+      // 重复结案明确拒绝，且不改变版本与记录
+      if (question.closedAt !== null) {
+        return sendError(ws, '该问题已结案，不能重复结案', 'QUESTION_CLOSED', room);
+      }
+      // 答复去空白后必须为 1～300 字；空白拒绝、超长拒绝（不截断）
+      const answer = String(msg.answer ?? '').trim();
+      if (!answer) {
+        return sendError(ws, '请填写答复内容', 'NO_QUESTION_ANSWER', room);
+      }
+      if (answer.length > QUESTION_ANSWER_MAX) {
+        return sendError(
+          ws,
+          `答复不能超过 ${QUESTION_ANSWER_MAX} 字（当前 ${answer.length} 字）`,
+          'QUESTION_ANSWER_TOO_LONG',
+          room
+        );
+      }
+      const now = Date.now();
+      // 结案：固定支持人数与支持者、答复人与时间，并快照沿合并链归入它的全部来源
+      question.closedAt = now;
+      question.answer = answer;
+      question.answeredBy = pid;
+      question.answeredByNick = me.nick;
+      question.answerSupporters = [...question.supporters].map((sp) => freezeQuestionSupporter(room, sp));
+      question.answerSources = freezeQuestionSources(room, question.id);
+      addLog(
+        room,
+        'question',
+        `主持人答复并结案了问题：「${question.text.length > 30 ? question.text.slice(0, 30) + '…' : question.text}」` +
+          `（固定 ${question.answerSupporters.length} 名支持者，含 ${question.answerSources.length} 条沿链来源）`
       );
       return commit(room, { undoReason: 'question_changed' });
     }

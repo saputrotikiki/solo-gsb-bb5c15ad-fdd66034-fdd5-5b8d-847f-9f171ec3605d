@@ -2243,6 +2243,201 @@ async function main() {
     await qh.close(); await q1b.close(); await q2.close();
   }
 
+  // 30. 现场问题墙：主持人答复结案（固定支持/沿链来源/已结案拒绝/答复校验/重连恢复）
+  {
+    const createdC = await createRoom('结案主持');
+    const ch = await hostJoin(createdC, '结案主持');
+    const cA = await guestJoin(createdC.room, '成员A');
+    const cB = await guestJoin(createdC.room, '成员B');
+    const cC = await guestJoin(createdC.room, '成员C');
+    await waitStable(ch, [cA, cB, cC]);
+    const idA = cA.joined.you.id;
+    const idB = cB.joined.you.id;
+    const idC = cC.joined.you.id;
+
+    const openQs = () => ch.snapshot.questions.open;
+    const closedQs = () => ch.snapshot.questions.closed;
+    const mergedQs = () => ch.snapshot.questions.merged;
+    const findOpen = (id) => openQs().find((q) => q.id === id);
+
+    // 四条问题：qA/qB/qC/qD
+    await guestSend(ch, cA, { type: 'question_submit', text: '问题A：预算？' });
+    await ch.waitFor((c) => c.snapshot.questions.open.length === 1);
+    const qA = openQs()[0];
+    await guestSend(ch, cB, { type: 'question_submit', text: '问题B：时间？' });
+    await ch.waitFor((c) => c.snapshot.questions.open.length === 2);
+    const qB = openQs().find((q) => q.authorId === idB);
+    await guestSend(ch, cC, { type: 'question_submit', text: '问题C：地点？' });
+    await ch.waitFor((c) => c.snapshot.questions.open.length === 3);
+    const qC = openQs().find((q) => q.authorId === idC);
+    await guestSend(ch, cA, { type: 'question_submit', text: '问题D：资料？' });
+    await ch.waitFor((c) => c.snapshot.questions.open.length === 4);
+    const qD = openQs().find((q) => q.text === '问题D：资料？');
+
+    // 支持：qA={A,B}，qB={B,C}，qC={C}
+    await guestSend(ch, cA, { type: 'question_support', questionId: qA.id });
+    await guestSend(ch, cB, { type: 'question_support', questionId: qA.id });
+    await ch.waitFor((c) => findOpen(qA.id) && findOpen(qA.id).supportCount === 2);
+    await guestSend(ch, cB, { type: 'question_support', questionId: qB.id });
+    await guestSend(ch, cC, { type: 'question_support', questionId: qB.id });
+    await ch.waitFor((c) => findOpen(qB.id) && findOpen(qB.id).supportCount === 2);
+    await guestSend(ch, cC, { type: 'question_support', questionId: qC.id });
+    await ch.waitFor((c) => findOpen(qC.id) && findOpen(qC.id).supportCount === 1);
+
+    // 链式合并：qA -> qB -> qC。qC 最终支持者 {A,B,C} 共 3 人
+    await hostCmd(ch, { type: 'question_merge', sourceId: qA.id, targetId: qB.id });
+    await hostCmd(ch, { type: 'question_merge', sourceId: qB.id, targetId: qC.id });
+    await ch.waitFor((c) => findOpen(qC.id) && findOpen(qC.id).supportCount === 3);
+    assert.strictEqual(openQs().length, 2, '只剩 qC、qD 未结案');
+    assert.strictEqual(mergedQs().length, 2);
+
+    // 30a. 非主持人不能结案 -> FORBIDDEN
+    cA.lastError = null;
+    await guestSend(ch, cA, { type: 'question_close', questionId: qD.id, answer: '答复' });
+    await cA.waitFor((c) => c.lastError && c.lastError.code === 'FORBIDDEN');
+
+    // 30b. 不存在的问题 -> NO_QUESTION
+    ch.lastError = null;
+    ch.send(Object.assign({ version: ch.v }, { type: 'question_close', questionId: 'q_ghost', answer: '答复' }));
+    await ch.waitFor((c) => c.lastError && c.lastError.code === 'NO_QUESTION');
+
+    // 30c. 已合并来源不能单独结案 -> QUESTION_MERGED
+    ch.lastError = null;
+    ch.send(Object.assign({ version: ch.v }, { type: 'question_close', questionId: qA.id, answer: '答复' }));
+    await ch.waitFor((c) => c.lastError && c.lastError.code === 'QUESTION_MERGED');
+
+    // 30d. 空白答复 -> NO_QUESTION_ANSWER，版本与记录不变
+    const vBlank = ch.v;
+    ch.lastError = null;
+    ch.send(Object.assign({ version: ch.v }, { type: 'question_close', questionId: qD.id, answer: '    ' }));
+    await ch.waitFor((c) => c.lastError && c.lastError.code === 'NO_QUESTION_ANSWER');
+    assert.strictEqual(ch.v, vBlank, '空白答复不改变版本');
+    assert.strictEqual(closedQs().length, 0, '空白答复不产生结案记录');
+
+    // 30e. 超长答复（301 字）-> QUESTION_ANSWER_TOO_LONG，版本不变
+    const vLong = ch.v;
+    ch.lastError = null;
+    ch.send(Object.assign({ version: ch.v }, { type: 'question_close', questionId: qD.id, answer: '答'.repeat(301) }));
+    await ch.waitFor((c) => c.lastError && c.lastError.code === 'QUESTION_ANSWER_TOO_LONG');
+    assert.strictEqual(ch.v, vLong, '超长答复不改变版本');
+
+    // 30f. 主持人结案 qC（链式终点）：固定 3 名支持者，快照 2 条沿链来源
+    const answer = '预算明细会后单独发出，时间地点不变。';
+    const vClose = ch.v;
+    ch.lastError = null;
+    await hostCmd(ch, { type: 'question_close', questionId: qC.id, answer });
+    assert.strictEqual(ch.v, vClose + 1, '结案是一次版本化提交');
+    assert.strictEqual(findOpen(qC.id), undefined, '结案问题从未结案列表移除');
+    assert.deepStrictEqual(openQs().map((q) => q.id), [qD.id], '仅 qD 仍在未结案列表');
+
+    const closedC = closedQs().find((q) => q.id === qC.id);
+    assert.ok(closedC, '结案问题出现在 closed 列表');
+    assert.strictEqual(closedC.answer, answer);
+    assert.strictEqual(closedC.answeredByNick, '结案主持');
+    assert.ok(closedC.closedAt > 0);
+    assert.strictEqual(closedC.supportCount, 3, '结案时固定支持人数为 3');
+    assert.deepStrictEqual(closedC.supporterIds.sort(), [idA, idB, idC].sort());
+    assert.deepStrictEqual(closedC.supporters.map((s) => s.id).sort(), [idA, idB, idC].sort());
+    assert.ok(closedC.supporters.every((s) => typeof s.nick === 'string' && s.nick), '支持者昵称已冻结');
+
+    // 沿链来源：qA（2 支持者，先合并）在前，qB（3 支持者）在后，按合并时间升序
+    assert.strictEqual(closedC.sources.length, 2, '直接来源 qB + 间接来源 qA');
+    const srcA = closedC.sources.find((s) => s.id === qA.id);
+    const srcB = closedC.sources.find((s) => s.id === qB.id);
+    assert.ok(srcA && srcB);
+    assert.strictEqual(closedC.sources[0].id, qA.id, '来源按合并时间升序');
+    assert.strictEqual(closedC.sources[1].id, qB.id);
+    assert.strictEqual(srcA.supportCount, 2, 'qA 合并时固定 2 名支持者');
+    assert.deepStrictEqual(srcA.supporterIds.sort(), [idA, idB].sort());
+    assert.strictEqual(srcA.mergedInto, qB.id, '直接去向仍为 qB');
+    assert.strictEqual(srcA.mergedRootId, qC.id, '沿链终点为 qC');
+    assert.strictEqual(srcB.supportCount, 3, 'qB 合并时固定 3 名支持者');
+    assert.deepStrictEqual(srcB.supporterIds.sort(), [idA, idB, idC].sort());
+    assert.strictEqual(srcB.mergedInto, qC.id);
+    assert.strictEqual(srcB.mergedRootId, qC.id);
+
+    // 30g. 已合并来源仍能找到最终答复
+    const mergedA = mergedQs().find((q) => q.id === qA.id);
+    const mergedBView = mergedQs().find((q) => q.id === qB.id);
+    assert.strictEqual(mergedA.rootClosed, true);
+    assert.strictEqual(mergedA.rootAnswer, answer, '沿链来源展示最终答复');
+    assert.strictEqual(mergedA.rootAnsweredByNick, '结案主持');
+    assert.ok(mergedA.rootClosedAt > 0);
+    assert.strictEqual(mergedBView.rootClosed, true);
+    assert.strictEqual(mergedBView.rootAnswer, answer);
+
+    // 30h. 重复结案 -> QUESTION_CLOSED，不改变版本与记录
+    const vDup = ch.v;
+    ch.lastError = null;
+    ch.send(Object.assign({ version: ch.v }, { type: 'question_close', questionId: qC.id, answer: '再答复一次' }));
+    await ch.waitFor((c) => c.lastError && c.lastError.code === 'QUESTION_CLOSED');
+    assert.strictEqual(ch.v, vDup, '重复结案不改变版本');
+    assert.strictEqual(closedQs().filter((q) => q.id === qC.id).length, 1, '不产生重复记录');
+
+    // 30i. 已结案问题不可再获支持 -> QUESTION_CLOSED，支持人数保持 3
+    const vSup = ch.v;
+    cC.lastError = null;
+    await guestSend(ch, cC, { type: 'question_support', questionId: qC.id });
+    await cC.waitFor((c) => c.lastError && c.lastError.code === 'QUESTION_CLOSED');
+    assert.strictEqual(ch.snapshot.questions.closed.find((q) => q.id === qC.id).supportCount, 3, '支持人数固定不变');
+    assert.strictEqual(ch.v, vSup, '被拒绝支持不改变版本');
+
+    // 已合并来源仍返回 QUESTION_MERGED（优先于 CLOSED）
+    cA.lastError = null;
+    await guestSend(ch, cA, { type: 'question_support', questionId: qA.id });
+    await cA.waitFor((c) => c.lastError && c.lastError.code === 'QUESTION_MERGED');
+
+    // 30j. 已结案问题不参与合并：作为目标 / 来源都返回 QUESTION_CLOSED
+    ch.lastError = null;
+    ch.send(Object.assign({ version: ch.v }, { type: 'question_merge', sourceId: qD.id, targetId: qC.id }));
+    await ch.waitFor((c) => c.lastError && c.lastError.code === 'QUESTION_CLOSED');
+    ch.lastError = null;
+    ch.send(Object.assign({ version: ch.v }, { type: 'question_merge', sourceId: qC.id, targetId: qD.id }));
+    await ch.waitFor((c) => c.lastError && c.lastError.code === 'QUESTION_CLOSED');
+    assert.strictEqual(mergedQs().length, 2, '被拒绝合并不改变记录');
+
+    // 30k. 过期版本 -> STALE_VERSION（版本守卫优先，附最新快照）
+    const staleV = ch.v - 1;
+    ch.lastError = null;
+    ch.send({ type: 'question_close', version: staleV, questionId: qC.id, answer: '过期答复' });
+    await ch.waitFor((c) => c.lastError && c.lastError.code === 'STALE_VERSION');
+    assert.ok(ch.lastError.snapshot, 'STALE_VERSION 应携带最新快照');
+    assert.strictEqual(ch.lastError.snapshot.version, ch.snapshot.version);
+
+    // 30l. 恰好 300 字答复合法：结案 qD；closed 按结案时间倒序（qD 在前）
+    const answer300 = '答'.repeat(300);
+    await hostCmd(ch, { type: 'question_close', questionId: qD.id, answer: answer300 });
+    assert.strictEqual(openQs().length, 0);
+    const closedAll = closedQs();
+    assert.strictEqual(closedAll.length, 2);
+    assert.strictEqual(closedAll[0].id, qD.id, '已结案按结案时间倒序');
+    assert.strictEqual(closedAll[0].answer, answer300);
+    assert.strictEqual(closedAll[1].id, qC.id);
+    // 0 支持者问题结案时固定 supportCount 为 0、来源为空
+    assert.strictEqual(closedAll[0].supportCount, 0);
+    assert.deepStrictEqual(closedAll[0].sources, []);
+
+    // 30m. 断线重连后结案记录、冻结支持者与沿链来源完整恢复
+    const secretA = cA.joined.you.secret;
+    await cA.close();
+    const cAb = new Client();
+    await cAb.open();
+    cAb.send({ type: 'join', room: createdC.room, nick: '成员A', participantId: idA, secret: secretA });
+    await cAb.waitFor((c) => c.joined && c.joined.you.id === idA);
+    assert.strictEqual(cAb.snapshot.questions.open.length, 0, '重连恢复未结案列表');
+    assert.strictEqual(cAb.snapshot.questions.closed.length, 2, '重连恢复已结案列表');
+    const qcBack = cAb.snapshot.questions.closed.find((q) => q.id === qC.id);
+    assert.ok(qcBack, '重连恢复结案问题');
+    assert.strictEqual(qcBack.answer, answer);
+    assert.strictEqual(qcBack.supportCount, 3);
+    assert.strictEqual(qcBack.sources.length, 2, '重连恢复沿链来源快照');
+    assert.strictEqual(qcBack.sources[0].id, qA.id);
+    const maBack = cAb.snapshot.questions.merged.find((q) => q.id === qA.id);
+    assert.strictEqual(maBack.rootAnswer, answer, '重连后来源问题仍能找到最终答复');
+
+    await ch.close(); await cAb.close(); await cB.close(); await cC.close();
+  }
+
   // 15. 房间不存在
   const ghost = new Client();
   await ghost.open();
