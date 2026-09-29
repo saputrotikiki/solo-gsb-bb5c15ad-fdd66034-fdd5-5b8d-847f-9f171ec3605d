@@ -131,6 +131,7 @@ const els = {
   questionList: $('#question-list'),
   questionEmpty: $('#question-empty'),
   questionCount: $('#question-count'),
+  questionClosed: $('#question-closed'),
   questionMerged: $('#question-merged'),
   toast: $('#toast-container')
 };
@@ -1892,6 +1893,7 @@ function renderLogs(snap) {
 // ---------------------------------------------------------------------------
 
 const QUESTION_TEXT_MAX = 120;
+const QUESTION_ANSWER_MAX = 300;
 
 /** 字数统计（按字符数计，与服务端 trim/slice 口径一致） */
 function syncQuestionCharCount() {
@@ -1905,11 +1907,12 @@ els.questionTextInput.addEventListener('input', syncQuestionCharCount);
 /**
  * 变化检测：首次快照（含重连）只播种，不弹提示。
  * - 我提交的问题出现 -> 成功提示；
- * - 我支持的问题被合并 -> 提示已并入的目标。
+ * - 我支持的问题被合并 -> 提示已并入的目标；
+ * - 我支持/提交的问题被结案 -> 提示已有答复。
  */
 function processQuestions(snap) {
-  const qs = snap.questions || { open: [], merged: [] };
-  const all = [...(qs.open || []), ...(qs.merged || [])];
+  const qs = snap.questions || { open: [], closed: [], merged: [] };
+  const all = [...(qs.open || []), ...(qs.closed || []), ...(qs.merged || [])];
   const seen = new Set();
   const myId = state.me ? state.me.id : null;
   for (const q of all) {
@@ -1922,9 +1925,14 @@ function processQuestions(snap) {
       if (prev && !prev.merged && q.merged && myId && q.supporterIds.includes(myId)) {
         toast(`你支持的问题已并入「${q.mergedIntoText || '另一条问题'}」`, 'info');
       }
+      if (prev && !prev.closed && q.closed && myId &&
+          (q.authorId === myId || (q.answer && q.answer.supporterIds.includes(myId)))) {
+        toast('你关注的问题已有主持人答复', 'info');
+      }
     }
     state.questionSeen.set(q.id, {
       merged: q.merged,
+      closed: q.closed,
       supportCount: q.supportCount,
       mergedInto: q.mergedInto
     });
@@ -1937,12 +1945,14 @@ function processQuestions(snap) {
 
 /**
  * 问题墙渲染：
- * - 未合并问题按快照顺序（服务端按支持人数降序、同票按提交时间升序）；
- * - 已合并问题列在底部可折叠区，标明直接去向与最终目标文本。
+ * - 未合并、未结案问题按快照顺序（服务端按支持人数降序、同票按提交时间升序）；
+ * - 已结案问题单独列在「已结案问题」区，固定展示答复、答复人与时间、支持情况；
+ * - 已合并问题列在底部可折叠区，标明直接去向、最终目标文本与最终答复。
  */
 function renderQuestions(snap) {
-  const qs = snap.questions || { open: [], merged: [] };
+  const qs = snap.questions || { open: [], closed: [], merged: [] };
   const open = qs.open || [];
+  const closed = qs.closed || [];
   const merged = qs.merged || [];
   const myId = state.me ? state.me.id : null;
   const isHost = !!(state.me && state.me.host);
@@ -1983,6 +1993,9 @@ function renderQuestions(snap) {
       ${isHost ? `
       <div class="question-host-actions">
         <button type="button" class="btn btn-ghost btn-mini"
+                data-q-act="close" data-q-id="${q.id}"
+                title="填写答复并结案，固定支持人数与来源问题">✅ 答复结案</button>
+        <button type="button" class="btn btn-ghost btn-mini"
                 data-q-act="merge" data-q-id="${q.id}"
                 title="把另一条问题并入这条问题">🔀 并入此条</button>
       </div>` : ''}
@@ -1990,10 +2003,56 @@ function renderQuestions(snap) {
     els.questionList.appendChild(li);
   });
 
+  renderClosedQuestions(closed);
   renderMergedQuestions(merged);
 }
 
-/** 已合并问题区：折叠展示，标明直接去向（可在未合并列表中定位最终目标） */
+/**
+ * 已结案问题区：始终可见的答复记录。
+ * 每条固定展示问题正文、答复正文、答复人与结案时间、结案时支持人数，
+ * 以及沿合并链归入它的来源问题（结案瞬间快照）。
+ */
+function renderClosedQuestions(closed) {
+  const box = els.questionClosed;
+  box.textContent = '';
+  if (!closed.length) return;
+
+  const sum = document.createElement('div');
+  sum.className = 'question-closed-title';
+  sum.textContent = `✅ 已结案问题（${closed.length}）`;
+  box.appendChild(sum);
+
+  const list = document.createElement('ul');
+  list.className = 'question-closed-list';
+  for (const q of closed) {
+    const a = q.answer;
+    const li = document.createElement('li');
+    li.className = 'question-closed-item';
+    const supporterNames = (a.supporters || []).map((s) => s.nick).slice(0, 6).join('、');
+    const supporterTip = (a.supporters || []).map((s) => s.nick).join('、');
+    const sources = (a.sources || [])
+      .map((s) => `<li class="question-source-item" title="${escapeHtml(s.supportCount)} 人支持">↳ ${escapeHtml(s.text)}</li>`)
+      .join('');
+    li.innerHTML = `
+      <div class="question-closed-text">${escapeHtml(q.text)}</div>
+      <div class="question-answer">
+        <span class="question-answer-tag">答复</span>
+        <span class="question-answer-text">${escapeHtml(a.text)}</span>
+      </div>
+      <div class="question-closed-meta">
+        <span>${escapeHtml(a.byNick)} 答复 · ${formatTime(a.closedAt)}</span>
+        <span class="question-supported-by" title="${escapeHtml(supporterTip)}">
+          结案时 👍 ${a.supportCount} 人${a.supportCount > 0 && supporterNames ? `（${escapeHtml(supporterNames)}）` : ''}
+        </span>
+      </div>
+      ${sources ? `<ul class="question-source-list"><li class="question-source-head">随合并归入的来源问题（${a.sources.length}）</li>${sources}</ul>` : ''}
+    `;
+    list.appendChild(li);
+  }
+  box.appendChild(list);
+}
+
+/** 已合并问题区：折叠展示，标明直接去向与最终目标；目标已结案时一并展示最终答复 */
 function renderMergedQuestions(merged) {
   const box = els.questionMerged;
   box.textContent = '';
@@ -2008,6 +2067,7 @@ function renderMergedQuestions(merged) {
   for (const q of merged) {
     const li = document.createElement('li');
     li.className = 'question-merged-item';
+    const rootAnswer = q.rootAnswer;
     li.innerHTML = `
       <div class="question-merged-text">${escapeHtml(q.text)}</div>
       <div class="question-merged-arrow">
@@ -2015,7 +2075,15 @@ function renderMergedQuestions(merged) {
         <span class="question-merged-target" title="合并去向：${escapeHtml(q.mergedRootId || q.mergedInto || '')}">
           「${escapeHtml(q.mergedIntoText || '另一条问题')}」
         </span>
+        <span class="question-merged-state">${rootAnswer ? '✅ 已有最终答复' : '⏳ 待答复'}</span>
       </div>
+      ${rootAnswer ? `
+      <div class="question-answer question-answer-compact">
+        <span class="question-answer-tag">最终答复</span>
+        <span class="question-answer-text">${escapeHtml(rootAnswer.text)}</span>
+      </div>
+      <div class="question-closed-meta"><span>${escapeHtml(rootAnswer.byNick)} 答复 · ${formatTime(rootAnswer.closedAt)}</span></div>
+      ` : ''}
     `;
     list.appendChild(li);
   }
@@ -2069,6 +2137,30 @@ els.questionList.addEventListener('click', (e) => {
   const sourceId = candidates[idx - 1].id;
   if (!confirm('确定合并？\n来源问题将标明去向且不再接受支持，两边支持者按成员去重合并。')) return;
   sendCmd({ type: 'question_merge', sourceId, targetId });
+});
+
+/**
+ * 主持人结案：点击未结案问题上的「✅ 答复结案」，填写 1～300 字答复。
+ * 结案瞬间由服务端固定支持人数、支持者与沿合并链归入的来源问题。
+ */
+els.questionList.addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-q-act="close"]');
+  if (!btn || !(state.me && state.me.host)) return;
+  const questionId = btn.dataset.qId;
+  const snap = state.snapshot;
+  const q = (snap.questions.open || []).find((x) => x.id === questionId);
+  if (!q) return toast('该问题已不在待答复列表', 'error');
+  const answer = prompt(
+    `为以下问题填写结案答复（1～${QUESTION_ANSWER_MAX} 字）：\n\n${q.text.slice(0, 120)}\n\n` +
+      `当前 ${q.supportCount} 人支持，答复后问题将固定记录并移入「已结案问题」，不可再支持或合并。`
+  );
+  if (answer === null) return;
+  const trimmed = answer.trim();
+  if (!trimmed) return toast('请填写答复内容', 'error');
+  if (trimmed.length > QUESTION_ANSWER_MAX) {
+    return toast(`答复不能超过 ${QUESTION_ANSWER_MAX} 字（当前 ${trimmed.length} 字）`, 'error');
+  }
+  sendCmd({ type: 'question_close', questionId, answer: trimmed });
 });
 
 function renderPeople(snap) {
